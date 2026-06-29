@@ -1,0 +1,247 @@
+// DistroTask — Prisma Schema
+// Production schema for a distributed task queue system.
+
+generator client {
+  provider        = "prisma-client-js"
+  previewFeatures = ["metrics"]
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// ENUMS
+// ─────────────────────────────────────────────────────────────────────────
+
+enum UserRole {
+  ADMIN
+  OPERATOR
+  VIEWER
+}
+
+enum TaskStatus {
+  PENDING // created, not yet published to broker
+  QUEUED // published to RabbitMQ, awaiting a worker
+  RUNNING // a worker has picked it up and is executing
+  COMPLETED // finished successfully
+  FAILED // exhausted retries, permanently failed (or non-retryable error)
+  RETRYING // failed once, scheduled for retry with backoff
+  CANCELLED // cancelled by a user before/while running
+  DEAD_LETTERED // moved to the DLQ after exceeding max retry attempts
+}
+
+enum TaskPriority {
+  CRITICAL
+  HIGH
+  NORMAL
+  LOW
+}
+
+enum WorkerStatus {
+  ONLINE
+  OFFLINE
+  IDLE
+  BUSY
+  DRAINING // shutting down gracefully, finishing in-flight tasks only
+}
+
+enum TaskLogLevel {
+  DEBUG
+  INFO
+  WARN
+  ERROR
+}
+
+enum ScheduleType {
+  ONE_TIME
+  CRON
+  INTERVAL
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// USERS & AUTH
+// ─────────────────────────────────────────────────────────────────────────
+
+model User {
+  id           String   @id @default(uuid())
+  email        String   @unique
+  passwordHash String   @map("password_hash")
+  firstName    String   @map("first_name")
+  lastName     String   @map("last_name")
+  role         UserRole @default(VIEWER)
+  isActive     Boolean  @default(true) @map("is_active")
+
+  // refresh token rotation (hashed, never store raw)
+  refreshTokenHash String? @map("refresh_token_hash")
+
+  lastLoginAt DateTime? @map("last_login_at")
+  createdAt   DateTime  @default(now()) @map("created_at")
+  updatedAt   DateTime  @updatedAt @map("updated_at")
+
+  tasks         Task[]         @relation("TaskCreatedBy")
+  taskSchedules TaskSchedule[] @relation("ScheduleCreatedBy")
+
+  @@index([email])
+  @@map("users")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// TASKS
+// ─────────────────────────────────────────────────────────────────────────
+
+model Task {
+  id   String @id @default(uuid())
+  name String
+
+  /// Logical task type, used by workers to route to the correct executor (e.g. "email.send", "report.generate")
+  type    String
+  payload Json   @default("{}")
+  result  Json?
+
+  status   TaskStatus   @default(PENDING)
+  priority TaskPriority @default(NORMAL)
+
+  queueName String @default("default") @map("queue_name")
+
+  // retry / backoff
+  maxRetries      Int       @default(3) @map("max_retries")
+  retryCount      Int       @default(0) @map("retry_count")
+  backoffStrategy String    @default("exponential") @map("backoff_strategy")
+  nextRetryAt     DateTime? @map("next_retry_at")
+
+  errorMessage String? @map("error_message")
+  errorStack   String? @map("error_stack")
+
+  // ownership / assignment
+  createdById String  @map("created_by_id")
+  createdBy   User    @relation("TaskCreatedBy", fields: [createdById], references: [id])
+  workerId    String? @map("worker_id")
+  worker      Worker? @relation(fields: [workerId], references: [id])
+
+  scheduleId String?        @map("schedule_id")
+  schedule   TaskSchedule?  @relation(fields: [scheduleId], references: [id])
+
+  // timing
+  queuedAt    DateTime? @map("queued_at")
+  startedAt   DateTime? @map("started_at")
+  completedAt DateTime? @map("completed_at")
+  /// milliseconds, computed at completion (completedAt - startedAt)
+  durationMs  Int?      @map("duration_ms")
+
+  // idempotency: dedupe retried/duplicate publishes
+  idempotencyKey String? @unique @map("idempotency_key")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  logs TaskLog[]
+
+  @@index([status])
+  @@index([priority])
+  @@index([createdById])
+  @@index([workerId])
+  @@index([queueName, status])
+  @@index([nextRetryAt])
+  @@index([createdAt])
+  @@map("tasks")
+}
+
+model TaskLog {
+  id     String       @id @default(uuid())
+  taskId String       @map("task_id")
+  task   Task         @relation(fields: [taskId], references: [id], onDelete: Cascade)
+  level  TaskLogLevel @default(INFO)
+  message String
+  metadata Json?
+
+  createdAt DateTime @default(now()) @map("created_at")
+
+  @@index([taskId])
+  @@index([createdAt])
+  @@map("task_logs")
+}
+
+model TaskSchedule {
+  id   String       @id @default(uuid())
+  name String
+  type ScheduleType
+
+  /// cron expression for CRON type, ISO duration / ms for INTERVAL type, ISO datetime for ONE_TIME
+  expression String
+
+  taskType    String @map("task_type")
+  payload     Json   @default("{}")
+  priority    TaskPriority @default(NORMAL)
+  queueName   String @default("default") @map("queue_name")
+
+  isActive  Boolean   @default(true) @map("is_active")
+  lastRunAt DateTime? @map("last_run_at")
+  nextRunAt DateTime? @map("next_run_at")
+
+  createdById String @map("created_by_id")
+  createdBy   User   @relation("ScheduleCreatedBy", fields: [createdById], references: [id])
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tasks Task[]
+
+  @@index([isActive, nextRunAt])
+  @@map("task_schedules")
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// WORKERS
+// ─────────────────────────────────────────────────────────────────────────
+
+model Worker {
+  id       String       @id @default(uuid())
+  /// human readable, e.g. "worker-email-01"
+  name     String       @unique
+  hostname String
+  pid      Int
+  status   WorkerStatus @default(OFFLINE)
+
+  /// task "type" strings this worker can execute, e.g. ["email.send", "report.generate"]
+  queues String[] @default([])
+
+  concurrency     Int @default(1)
+  currentTaskCount Int @default(0) @map("current_task_count")
+
+  version String?
+
+  lastHeartbeatAt DateTime? @map("last_heartbeat_at")
+  startedAt       DateTime  @default(now()) @map("started_at")
+  stoppedAt       DateTime? @map("stopped_at")
+
+  createdAt DateTime @default(now()) @map("created_at")
+  updatedAt DateTime @updatedAt @map("updated_at")
+
+  tasks   Task[]
+  metrics WorkerMetric[]
+
+  @@index([status])
+  @@index([lastHeartbeatAt])
+  @@map("workers")
+}
+
+model WorkerMetric {
+  id       String @id @default(uuid())
+  workerId String @map("worker_id")
+  worker   Worker @relation(fields: [workerId], references: [id], onDelete: Cascade)
+
+  cpuUsagePercent    Float? @map("cpu_usage_percent")
+  memoryUsageMb      Float? @map("memory_usage_mb")
+  tasksProcessed     Int    @default(0) @map("tasks_processed")
+  tasksFailed        Int    @default(0) @map("tasks_failed")
+  /// rolling average task duration, ms, at the time of this metric snapshot
+  avgDurationMs      Float? @map("avg_duration_ms")
+  queueDepthSnapshot Int?   @map("queue_depth_snapshot")
+
+  recordedAt DateTime @default(now()) @map("recorded_at")
+
+  @@index([workerId, recordedAt])
+  @@map("worker_metrics")
+}

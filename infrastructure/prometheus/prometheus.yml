@@ -1,0 +1,22 @@
+global:
+  scrape_interval: 10s
+  evaluation_interval: 10s
+
+scrape_configs:
+  - job_name: 'distrotask-api'
+    metrics_path: '/api/v1/monitoring/prometheus'
+    static_configs:
+      - targets: ['api:3001']
+        labels:
+          service: 'api'
+
+  - job_name: 'distrotask-worker'
+    metrics_path: '/metrics'
+    static_configs:
+      - targets: ['worker:9100']
+        labels:
+          service: 'worker'
+
+  - job_name: 'prometheus'
+    static_configs:
+      - targets: ['localhost:9090']

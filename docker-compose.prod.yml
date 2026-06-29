@@ -1,0 +1,40 @@
+# Production overlay — adds an Nginx reverse proxy in front of the api/web
+# services. Use alongside the base compose file:
+#
+#   docker compose -f docker-compose.yml -f docker-compose.prod.yml up --build
+#
+# This is intentionally a separate, additive file rather than a change to
+# docker-compose.yml: local development wants direct port access to every
+# service (5432, 5672, 3001, 3000, ...) for convenience, whereas production
+# wants a single ingress point (Nginx on 80/443) with the backing services
+# kept off the public network entirely.
+
+services:
+  nginx:
+    image: nginx:1.27-alpine
+    container_name: distrotask-nginx
+    restart: unless-stopped
+    volumes:
+      - ./infrastructure/nginx/nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./infrastructure/nginx/ssl:/etc/nginx/ssl:ro
+    ports:
+      - '80:80'
+      - '443:443'
+    depends_on:
+      api:
+        condition: service_healthy
+      web:
+        condition: service_started
+    healthcheck:
+      test: ['CMD', 'wget', '-qO-', 'http://localhost/healthz']
+      interval: 10s
+      timeout: 5s
+      retries: 5
+      start_period: 10s
+    networks: [distrotask-net]
+
+  # In production, the application containers should not need to publish
+  # their ports to the host at all — only Nginx is internet-facing. See
+  # docs/deployment.md Section 3 for the full production hardening checklist
+  # (binding service ports to loopback only, managed Postgres, secret
+  # injection, etc).
