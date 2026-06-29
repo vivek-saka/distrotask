@@ -6,11 +6,9 @@
 
 ---
 
-## Overview
+DistroTask is a distributed task processing platform designed to execute long-running and resource-intensive background jobs reliably and efficiently. Instead of processing tasks synchronously inside the API, tasks are stored in PostgreSQL, published to RabbitMQ, and executed asynchronously by scalable worker services based on their priority.
 
-DistroTask lets you submit a task (e.g. "send this email", "generate this report") through a REST API or dashboard. The task is durably persisted, published onto a priority-aware RabbitMQ queue, picked up by one of N worker processes, executed, and its result reported back — all visible live on a real-time dashboard and exported as Prometheus metrics.
-
-It is a **monorepo** (Turborepo + npm workspaces) with two deployable backend services, a shared types/queue-topology package, and a Next.js dashboard, all orchestrated by a single `docker compose up`.
+The platform provides real-time task monitoring, worker management, retry mechanisms, dead-letter queues, priority scheduling, WebSocket-based live updates, and system observability through Prometheus and Grafana. Its architecture enables applications to handle background workloads such as email delivery, report generation, image processing, scheduled jobs, and external API integrations without blocking user requests.
 
 ---
 
